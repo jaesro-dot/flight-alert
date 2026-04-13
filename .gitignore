@@ -1,0 +1,23 @@
+# Dependencias
+node_modules/
+
+# Variables de entorno (contienen tokens y credenciales)
+.env
+.env.local
+.env.*.local
+
+# Base de datos (datos en tiempo de ejecución)
+data/*.db
+data/*.db-shm
+data/*.db-wal
+
+# Archivos de debug y pruebas temporales
+debug-*.png
+test-scraping.js
+
+# Configuración local de Claude Code
+.claude/settings.local.json
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
