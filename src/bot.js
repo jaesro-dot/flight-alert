@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const cron = require('node-cron');
 const { ChartJSNodeCanvas } = require('chartjs-node-canvas');
 const { addAlert, getAlertsByChatId, removeAlert, getHistoryByChatId } = require('./storage');
-const { fetchFlightOptions } = require('./flights');
+const { fetchFlightOptions, fetchReturnOptions } = require('./flights');
 const { checkAlerts } = require('./checker');
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
@@ -18,24 +18,38 @@ const END_HOUR   = parseInt(process.env.CHECK_END_HOUR   || '23', 10);
 
 const bot = new TelegramBot(TOKEN, { polling: true });
 
-// Selecciones pendientes: entre que el usuario envía /alert y toca un botón.
-// Clave -> { chatId, origin, destination, date, returnDate, options }
+// Selecciones pendientes (entre /alert y los toques de botón).
+// clave -> { chatId, origin, destination, date, returnDate, options,
+//            outbound, outboundMode, returnOptions }
 const pendingSelections = new Map();
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+const NUMS = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
+
+// ─── Helpers de formato ───────────────────────────────────────────────────────
+
+function horaDe(raw) {
+  return String(raw || '').split(' ')[1] || raw || '—';
+}
+
+function lineaOpcion(o, i) {
+  const stops = o.stops === 0 ? 'directo' : `${o.stops} escala${o.stops > 1 ? 's' : ''}`;
+  const dur = o.duration ? ` · ${o.duration}` : '';
+  return `${NUMS[i]} *$${o.price}* · 🛫 ${o.departureTime} → 🛬 ${o.arrivalTime}\n     ${o.airline} · ${stops}${dur}\n\n`;
+}
 
 function formatAlert(a) {
   const trip = a.returnDate
     ? `${a.date} → ${a.returnDate} (ida y vuelta)`
     : `${a.date} (solo ida)`;
 
-  // Muestra el vuelo elegido si la alerta lo tiene (alertas nuevas)
   let target = '';
   if (a.mode === 'specific' && a.targetDeparture) {
-    const hora = String(a.targetDeparture).split(' ')[1] || a.targetDeparture;
-    target = `\n  🎯 Vuelo: 🛫 ${hora}${a.targetAirline ? ` · ${a.targetAirline}` : ''}`;
+    target += `\n  🛫 Ida: ${horaDe(a.targetDeparture)}${a.targetAirline ? ` · ${a.targetAirline}` : ''}`;
   } else if (a.mode === 'cheapest') {
-    target = `\n  🎯 El más barato de la ruta`;
+    target += `\n  🎯 El más barato de la ruta`;
+  }
+  if (a.returnDeparture) {
+    target += `\n  🛬 Vuelta: ${horaDe(a.returnDeparture)}${a.returnAirline ? ` · ${a.returnAirline}` : ''}`;
   }
 
   return (
@@ -46,37 +60,90 @@ function formatAlert(a) {
   );
 }
 
-// Mensaje con las opciones más económicas y sus horarios
+// Mensaje de opciones de IDA
 function formatOptionsMessage(orig, dest, date, returnDate, options) {
-  const nums = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
   const tripLabel = returnDate
     ? `${date} → ${returnDate} (ida y vuelta)`
     : `${date} (solo ida)`;
-
-  let msg = `✈️ *${orig} → ${dest}*\n📅 ${tripLabel}\n\nLas ${options.length} más económicas:\n\n`;
-  options.forEach((o, i) => {
-    const stops = o.stops === 0 ? 'directo' : `${o.stops} escala${o.stops > 1 ? 's' : ''}`;
-    const dur = o.duration ? ` · ${o.duration}` : '';
-    msg += `${nums[i]} *$${o.price}* · 🛫 ${o.departureTime} → 🛬 ${o.arrivalTime}\n`;
-    msg += `     ${o.airline} · ${stops}${dur}\n\n`;
-  });
-  if (returnDate) msg += `_(horarios del tramo de ida; el precio es el total ida y vuelta)_\n\n`;
+  let msg = `✈️ *${orig} → ${dest}*\n📅 ${tripLabel}\n\n`;
+  msg += returnDate ? `Elige el *vuelo de ida* (${options.length} más económicos):\n\n`
+                    : `Las ${options.length} más económicas:\n\n`;
+  options.forEach((o, i) => { msg += lineaOpcion(o, i); });
+  if (returnDate) msg += `_(horarios de la ida; el precio es el total ida y vuelta)_\n\n`;
   msg += `_Toca el vuelo que quieres monitorear:_`;
   return msg;
 }
 
-// Teclado inline: etiqueta corta en los botones (los horarios van en el texto)
-function buildOptionsKeyboard(key, options) {
-  const nums = ['1️⃣', '2️⃣', '3️⃣', '4️⃣', '5️⃣'];
-  const buttons = options.map((o, i) => ({
-    text: `${nums[i]} $${o.price}`,
-    callback_data: `pick:${key}:${i}`,
-  }));
+// Mensaje de opciones de VUELTA (tras elegir la ida)
+function formatReturnMessage(pending, outbound, returnOptions) {
+  let msg = `✅ *Ida:* 🛫 ${outbound.departureTime} → 🛬 ${outbound.arrivalTime} · ${outbound.airline}\n\n`;
+  msg += `Ahora elige el *vuelo de vuelta* (${pending.destination} → ${pending.origin}, ${pending.returnDate}):\n\n`;
+  returnOptions.forEach((o, i) => { msg += lineaOpcion(o, i); });
+  msg += `_(precio total ida y vuelta)_`;
+  return msg;
+}
 
+function buildKeyboard(prefix, key, options, cheapLabel) {
+  const buttons = options.map((o, i) => ({
+    text: `${NUMS[i]} $${o.price}`,
+    callback_data: `${prefix}:${key}:${i}`,
+  }));
   const rows = [];
   for (let i = 0; i < buttons.length; i += 3) rows.push(buttons.slice(i, i + 3)); // filas de 3
-  rows.push([{ text: '💰 Monitorear el más barato', callback_data: `pick:${key}:cheap` }]);
+  rows.push([{ text: cheapLabel, callback_data: `${prefix}:${key}:cheap` }]);
   return { reply_markup: { inline_keyboard: rows } };
+}
+
+// Crea la alerta y reemplaza el mensaje por la confirmación
+function createAlertAndConfirm(query, key, pending, outbound, returnLeg, outboundMode) {
+  const alert = addAlert({
+    chatId: pending.chatId,
+    origin: pending.origin,
+    destination: pending.destination,
+    date: pending.date,
+    returnDate: pending.returnDate,
+    mode: outboundMode,
+    targetDeparture: outboundMode === 'specific' ? outbound.departureRaw : null,
+    targetAirline: outboundMode === 'specific' ? outbound.airline : null,
+    returnDeparture: returnLeg ? returnLeg.departureRaw : null,
+    returnAirline: returnLeg ? returnLeg.airline : null,
+    // En ida y vuelta, el precio de la vuelta elegida ya es el total del viaje.
+    lastPrice: returnLeg ? returnLeg.price : outbound.price,
+  });
+
+  pendingSelections.delete(key);
+
+  const tripLabel = pending.returnDate
+    ? `${pending.date} → ${pending.returnDate} (ida y vuelta)`
+    : `${pending.date} (solo ida)`;
+
+  let detalle;
+  if (returnLeg) {
+    detalle =
+      `🛫 Ida: ${outbound.departureTime} → ${outbound.arrivalTime} · ${outbound.airline}\n` +
+      `🛬 Vuelta: ${returnLeg.departureTime} → ${returnLeg.arrivalTime} · ${returnLeg.airline}`;
+  } else if (outboundMode === 'cheapest') {
+    detalle = '🎯 el vuelo más barato de la ruta';
+  } else {
+    detalle = `🛫 salida ${outbound.departureTime} → ${outbound.arrivalTime} · ${outbound.airline}`;
+  }
+
+  const price = returnLeg ? returnLeg.price : outbound.price;
+
+  const confirmation =
+    `✅ *¡Alerta creada!*\n\n` +
+    `✈️ *${pending.origin} → ${pending.destination}*\n` +
+    `📅 ${tripLabel}\n` +
+    `${detalle}\n` +
+    `💰 Precio base: *$${price}*\n` +
+    `🆔 \`${alert.id}\`\n\n` +
+    `_Te avisaré cuando el precio baje._`;
+
+  bot.editMessageText(confirmation, {
+    chat_id: query.message.chat.id,
+    message_id: query.message.message_id,
+    parse_mode: 'Markdown',
+  });
 }
 
 // ─── Comandos ─────────────────────────────────────────────────────────────────
@@ -93,8 +160,8 @@ bot.onText(/\/start/, (msg) => {
       `/remove <id> — Eliminar una alerta\n` +
       `/check — Revisar precios ahora\n` +
       `/grafico — Ver historial de precios\n\n` +
-      `Al crear una alerta te mostraré las opciones más económicas con su ` +
-      `horario y podrás elegir cuál monitorear.\n\n` +
+      `Al crear una alerta te muestro las opciones más económicas con su ` +
+      `horario. En ida y vuelta eliges primero la ida y luego la vuelta.\n\n` +
       `*Ejemplos:*\n` +
       `/alert LIM TCQ 2026-05-09\n` +
       `/alert LIM MIA 2026-06-01 2026-06-10`,
@@ -114,7 +181,7 @@ bot.onText(/\/routes/, (msg) => {
   );
 });
 
-// /alert → busca opciones, las muestra con horarios y ofrece botones para elegir
+// /alert → busca la ida, la muestra con horarios y ofrece botones
 bot.onText(/\/alert (.+)/, async (msg, match) => {
   const chatId = msg.chat.id;
   const parts = match[1].trim().split(/\s+/);
@@ -151,8 +218,6 @@ bot.onText(/\/alert (.+)/, async (msg, match) => {
     return bot.sendMessage(chatId, '⚠️ No pude consultar vuelos ahora. Intenta de nuevo en un momento.');
   }
 
-  console.log('[alert] opciones:', JSON.stringify(options)); // DEBUG temporal — quítalo cuando confirmes horarios
-
   if (!options || options.length === 0) {
     return bot.sendMessage(
       chatId,
@@ -160,7 +225,6 @@ bot.onText(/\/alert (.+)/, async (msg, match) => {
     );
   }
 
-  // Guarda la selección pendiente (los datos pesados NO caben en callback_data)
   const key = `${chatId}_${Date.now()}`;
   pendingSelections.set(key, {
     chatId: String(chatId),
@@ -175,78 +239,89 @@ bot.onText(/\/alert (.+)/, async (msg, match) => {
   bot.sendMessage(
     chatId,
     formatOptionsMessage(orig, dest, date, isRoundTrip ? returnDate : undefined, options),
-    { parse_mode: 'Markdown', ...buildOptionsKeyboard(key, options) }
+    { parse_mode: 'Markdown', ...buildKeyboard('pick', key, options, '💰 Monitorear el más barato') }
   );
 });
 
-// Elección de vuelo (toque de botón)
+// ─── Elección de vuelos (botones) ─────────────────────────────────────────────
+
 bot.on('callback_query', async (query) => {
   const data = query.data || '';
-  if (!data.startsWith('pick:')) return;
 
-  const [, key, sel] = data.split(':');
-  const pending = pendingSelections.get(key);
+  // Paso 1: elección de la IDA
+  if (data.startsWith('pick:')) {
+    const [, key, sel] = data.split(':');
+    const pending = pendingSelections.get(key);
+    if (!pending) {
+      return bot.answerCallbackQuery(query.id, {
+        text: 'La selección expiró. Envía /alert de nuevo.', show_alert: true,
+      });
+    }
 
-  if (!pending) {
-    return bot.answerCallbackQuery(query.id, {
-      text: 'La selección expiró. Envía /alert de nuevo.',
-      show_alert: true,
+    const outboundMode = sel === 'cheap' ? 'cheapest' : 'specific';
+    const chosen = sel === 'cheap' ? pending.options[0] : pending.options[parseInt(sel, 10)];
+    if (!chosen) return bot.answerCallbackQuery(query.id, { text: 'Opción no válida.' });
+
+    // Solo ida, o sin token de vuelta disponible → crear alerta directo
+    if (!pending.returnDate || !chosen.departureToken) {
+      bot.answerCallbackQuery(query.id, { text: '✅ Alerta creada' });
+      return createAlertAndConfirm(query, key, pending, chosen, null, outboundMode);
+    }
+
+    // Ida y vuelta → segundo paso: buscar las vueltas para esta ida
+    bot.answerCallbackQuery(query.id, { text: 'Buscando vuelos de vuelta…' });
+    bot.editMessageText('🔍 Buscando vuelos de vuelta para la ida elegida…', {
+      chat_id: query.message.chat.id, message_id: query.message.message_id,
     });
+
+    let returnOptions;
+    try {
+      returnOptions = await fetchReturnOptions(
+        pending.origin, pending.destination, pending.date, pending.returnDate,
+        chosen.departureToken, 5
+      );
+    } catch (e) {
+      console.error('[return] error:', e.message);
+      return bot.editMessageText('⚠️ No pude cargar los vuelos de vuelta. Envía /alert de nuevo.', {
+        chat_id: query.message.chat.id, message_id: query.message.message_id,
+      });
+    }
+
+    // Sin vueltas → crear con la ida elegida
+    if (!returnOptions.length) {
+      return createAlertAndConfirm(query, key, pending, chosen, null, outboundMode);
+    }
+
+    pending.outbound = chosen;
+    pending.outboundMode = outboundMode;
+    pending.returnOptions = returnOptions;
+    pendingSelections.set(key, pending);
+
+    return bot.editMessageText(
+      formatReturnMessage(pending, chosen, returnOptions),
+      {
+        chat_id: query.message.chat.id, message_id: query.message.message_id,
+        parse_mode: 'Markdown', ...buildKeyboard('ret', key, returnOptions, '💰 La vuelta más barata'),
+      }
+    );
   }
 
-  let chosen, mode;
-  if (sel === 'cheap') {
-    chosen = pending.options[0];
-    mode = 'cheapest';
-  } else {
-    chosen = pending.options[parseInt(sel, 10)];
-    mode = 'specific';
+  // Paso 2: elección de la VUELTA
+  if (data.startsWith('ret:')) {
+    const [, key, sel] = data.split(':');
+    const pending = pendingSelections.get(key);
+    if (!pending || !pending.returnOptions || !pending.outbound) {
+      return bot.answerCallbackQuery(query.id, {
+        text: 'La selección expiró. Envía /alert de nuevo.', show_alert: true,
+      });
+    }
+
+    const chosenReturn = sel === 'cheap' ? pending.returnOptions[0] : pending.returnOptions[parseInt(sel, 10)];
+    if (!chosenReturn) return bot.answerCallbackQuery(query.id, { text: 'Opción no válida.' });
+
+    bot.answerCallbackQuery(query.id, { text: '✅ Alerta creada' });
+    return createAlertAndConfirm(query, key, pending, pending.outbound, chosenReturn, pending.outboundMode);
   }
-  if (!chosen) {
-    return bot.answerCallbackQuery(query.id, { text: 'Opción no válida.' });
-  }
-
-  // Crea la alerta. Los campos mode/targetDeparture/targetAirline/lastPrice
-  // se envían para que storage los use; si storage aún no los maneja, los ignora
-  // y la alerta se crea igual (compatibilidad).
-  const alert = addAlert({
-    chatId: pending.chatId,
-    origin: pending.origin,
-    destination: pending.destination,
-    date: pending.date,
-    returnDate: pending.returnDate,
-    mode,
-    targetDeparture: mode === 'specific' ? chosen.departureRaw : null,
-    targetAirline: mode === 'specific' ? chosen.airline : null,
-    lastPrice: chosen.price,
-  });
-
-  pendingSelections.delete(key);
-  bot.answerCallbackQuery(query.id, { text: '✅ Alerta creada' });
-
-  const tripLabel = pending.returnDate
-    ? `${pending.date} → ${pending.returnDate} (ida y vuelta)`
-    : `${pending.date} (solo ida)`;
-
-  const modeLabel = mode === 'cheapest'
-    ? 'el vuelo más barato de la ruta'
-    : `salida 🛫 ${chosen.departureTime} → 🛬 ${chosen.arrivalTime} · ${chosen.airline}`;
-
-  const confirmation =
-    `✅ *¡Alerta creada!*\n\n` +
-    `✈️ *${pending.origin} → ${pending.destination}*\n` +
-    `📅 ${tripLabel}\n` +
-    `🎯 Monitoreando: ${modeLabel}\n` +
-    `💰 Precio base: *$${chosen.price}*\n` +
-    `🆔 \`${alert.id}\`\n\n` +
-    `_Te avisaré cuando el precio baje._`;
-
-  // Reemplaza el mensaje de opciones por la confirmación (quita los botones)
-  bot.editMessageText(confirmation, {
-    chat_id: query.message.chat.id,
-    message_id: query.message.message_id,
-    parse_mode: 'Markdown',
-  });
 });
 
 bot.onText(/\/list/, (msg) => {
@@ -307,7 +382,6 @@ bot.onText(/\/grafico/, async (msg) => {
     );
   }
 
-  // Agrupar por ruta+fecha para datasets
   const groups = {};
   for (const r of rows) {
     const key = `${r.origin}→${r.destination} (${r.date})`;
@@ -315,7 +389,6 @@ bot.onText(/\/grafico/, async (msg) => {
     groups[key].points.push({ x: r.checked_at, y: r.price });
   }
 
-  // Eje X unificado (todos los timestamps únicos, ordenados)
   const allTs = [...new Set(rows.map(r => r.checked_at))].sort();
   const labels = allTs.map(ts => {
     const d = new Date(ts);
@@ -323,7 +396,6 @@ bot.onText(/\/grafico/, async (msg) => {
   });
 
   const datasets = Object.entries(groups).map(([label, { points }], idx) => {
-    // Mapear precios a los timestamps globales (null si no hay dato en ese ts)
     const priceMap = Object.fromEntries(points.map(p => [p.x, p.y]));
     return {
       label,
@@ -342,9 +414,7 @@ bot.onText(/\/grafico/, async (msg) => {
     data: { labels, datasets },
     options: {
       plugins: {
-        legend: {
-          labels: { color: '#e2e8f0', font: { size: 12 } },
-        },
+        legend: { labels: { color: '#e2e8f0', font: { size: 12 } } },
         title: {
           display: true,
           text: 'Historial de precios — tus alertas',
@@ -353,14 +423,8 @@ bot.onText(/\/grafico/, async (msg) => {
         },
       },
       scales: {
-        x: {
-          ticks: { color: '#94a3b8', maxRotation: 45, font: { size: 10 } },
-          grid:  { color: '#263349' },
-        },
-        y: {
-          ticks: { color: '#94a3b8', callback: v => '$' + v },
-          grid:  { color: '#263349' },
-        },
+        x: { ticks: { color: '#94a3b8', maxRotation: 45, font: { size: 10 } }, grid: { color: '#263349' } },
+        y: { ticks: { color: '#94a3b8', callback: v => '$' + v }, grid: { color: '#263349' } },
       },
     },
   });
@@ -379,17 +443,19 @@ function sendTriggerNotification(alert) {
   const drop = alert.previousPrice - alert.currentPrice;
   const pct  = Math.round((drop / alert.previousPrice) * 100);
 
-  // Muestra el horario del vuelo elegido si la alerta lo tiene
-  const horario = alert.targetDeparture
-    ? `🛫 ${String(alert.targetDeparture).split(' ')[1] || alert.targetDeparture}` +
-      `${alert.targetAirline ? ` · ${alert.targetAirline}` : ''}\n`
-    : '';
+  let horario = '';
+  if (alert.targetDeparture) {
+    horario += `🛫 Ida: ${horaDe(alert.targetDeparture)}${alert.targetAirline ? ` · ${alert.targetAirline}` : ''}\n`;
+  }
+  if (alert.returnDeparture) {
+    horario += `🛬 Vuelta: ${horaDe(alert.returnDeparture)}${alert.returnAirline ? ` · ${alert.returnAirline}` : ''}\n`;
+  }
 
   const msg =
     `🚨 *¡Precio bajó!*\n\n` +
     `✈️ *${alert.origin} → ${alert.destination}*\n` +
     `📅 ${tripLabel}\n` +
-    (horario ? `${horario}` : '') +
+    horario +
     `💰 Precio actual: *$${alert.currentPrice}*\n` +
     `📉 Precio anterior: *$${alert.previousPrice}* (↓ $${drop} · ${pct}%)\n\n` +
     `¡Reserva ahora antes de que suba!`;
