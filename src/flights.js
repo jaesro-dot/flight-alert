@@ -1,91 +1,88 @@
-/**
- * Flight price provider via SerpApi (Google Flights engine).
- *
- * Docs: https://serpapi.com/google-flights-api
- * Prices are returned in USD (currency: USD).
- * Returns the lowest price found, or null on failure.
- */
-
-require('dotenv').config();
+// src/flights.js
+// Consulta de vuelos vía SerpApi (Google Flights)
+// Exporta:
+//   fetchFlightOptions()  -> lista de opciones más baratas CON horarios  (NUEVO)
+//   fetchPrice()          -> precio mínimo                               (compatibilidad)
+//
+// NOTA: si tu flights.js actual exporta más funciones (p.ej. para el /grafico),
+// conserva esas exportaciones y solo reemplaza/añade lo de abajo.
 
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 const SERPAPI_URL = 'https://serpapi.com/search';
 
-/**
- * Fetch the current lowest price for a flight via SerpApi.
- *
- * @param {string} origin       IATA airport code (e.g. "LIM")
- * @param {string} destination  IATA airport code (e.g. "TCQ")
- * @param {string} date         YYYY-MM-DD (outbound)
- * @param {string} [returnDate] YYYY-MM-DD — if provided, round-trip search
- * @returns {Promise<number|null>} lowest price in USD, or null on failure
- */
-async function fetchPrice(origin, destination, date, returnDate) {
-  const tag = `${origin.toUpperCase()}→${destination.toUpperCase()} ${date}${returnDate ? ' RT' : ' OW'}`;
+// SerpApi entrega los horarios como "2026-05-09 08:15" -> devolvemos "08:15"
+function soloHora(raw) {
+  if (!raw) return '—';
+  const partes = String(raw).split(' ');
+  return partes.length === 2 ? partes[1] : raw;
+}
 
-  if (!SERPAPI_KEY) {
-    console.error('[flights] SERPAPI_KEY is not set in environment variables');
-    return null;
-  }
+function minutosLegibles(min) {
+  if (min === undefined || min === null) return '';
+  const h = Math.floor(min / 60);
+  const m = min % 60;
+  return m ? `${h}h ${m}m` : `${h}h`;
+}
 
+// Convierte una entrada de best_flights / other_flights a un objeto simple.
+// En ida y vuelta, los segmentos corresponden al tramo de IDA y el price
+// es el total estimado del viaje redondo (así lo entrega SerpApi).
+function parseOpcion(entry) {
+  const segs = entry.flights || [];
+  if (!segs.length) return null;
+  const primero = segs[0];
+  const ultimo = segs[segs.length - 1];
+  return {
+    price: entry.price,
+    airline: primero.airline || 'Varias',
+    flightNumber: primero.flight_number || '',
+    departureTime: soloHora(primero.departure_airport?.time),
+    arrivalTime: soloHora(ultimo.arrival_airport?.time),
+    departureRaw: primero.departure_airport?.time || '', // "2026-05-09 08:15" (clave para identificar el vuelo)
+    stops: segs.length - 1,
+    duration: minutosLegibles(entry.total_duration),
+  };
+}
+
+// NUEVO: devuelve las N opciones más baratas, ordenadas por precio, con horarios.
+async function fetchFlightOptions(origin, destination, departDate, returnDate, limit = 3) {
   const params = new URLSearchParams({
-    engine:        'google_flights',
-    api_key:       SERPAPI_KEY,
-    departure_id:  origin.toUpperCase(),
-    arrival_id:    destination.toUpperCase(),
-    outbound_date: date,
-    currency:      'USD',
-    hl:            'en',
+    engine: 'google_flights',
+    departure_id: origin,
+    arrival_id: destination,
+    outbound_date: departDate,
+    currency: 'USD',
+    hl: 'es',
+    api_key: SERPAPI_KEY,
   });
 
   if (returnDate) {
     params.set('return_date', returnDate);
-    params.set('type', '1'); // 1 = round-trip
+    params.set('type', '1'); // ida y vuelta
   } else {
-    params.set('type', '2'); // 2 = one-way
+    params.set('type', '2'); // solo ida
   }
 
-  console.log(`[flights] Querying SerpApi for ${tag}`);
+  const res = await fetch(`${SERPAPI_URL}?${params.toString()}`);
+  if (!res.ok) throw new Error(`SerpApi HTTP ${res.status}`);
 
-  try {
-    const res = await fetch(`${SERPAPI_URL}?${params}`);
+  const data = await res.json();
+  if (data.error) throw new Error(`SerpApi: ${data.error}`);
 
-    if (!res.ok) {
-      const body = await res.text().catch(() => '');
-      console.error(`[flights] SerpApi HTTP ${res.status} for ${tag}: ${body.slice(0, 200)}`);
-      return null;
-    }
+  const todas = [...(data.best_flights || []), ...(data.other_flights || [])];
 
-    const data = await res.json();
+  const opciones = todas
+    .map(parseOpcion)
+    .filter(Boolean)
+    .sort((a, b) => a.price - b.price);
 
-    // SerpApi returns best_flights and other_flights arrays
-    const allFlights = [
-      ...(data.best_flights  || []),
-      ...(data.other_flights || []),
-    ];
-
-    if (!allFlights.length) {
-      console.log(`[flights] No flights returned by SerpApi for ${tag}`);
-      return null;
-    }
-
-    const prices = allFlights
-      .map((f) => f.price)
-      .filter((p) => typeof p === 'number' && p > 0);
-
-    if (!prices.length) {
-      console.log(`[flights] No valid prices in SerpApi response for ${tag}`);
-      return null;
-    }
-
-    const lowest = Math.min(...prices);
-    console.log(`[flights] Lowest price for ${tag}: $${lowest} USD`);
-    return lowest;
-
-  } catch (err) {
-    console.error(`[flights] Error fetching price for ${tag}: ${err.message}`);
-    return null;
-  }
+  return opciones.slice(0, limit);
 }
 
-module.exports = { fetchPrice };
+// COMPATIBILIDAD: precio mínimo (lo que usa hoy el cron / dashboard).
+async function fetchPrice(origin, destination, departDate, returnDate) {
+  const opciones = await fetchFlightOptions(origin, destination, departDate, returnDate, 1);
+  return opciones.length ? opciones[0].price : null;
+}
+
+module.exports = { fetchPrice, fetchFlightOptions };
